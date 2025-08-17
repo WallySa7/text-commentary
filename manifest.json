@@ -1,0 +1,11 @@
+{
+	"id": "text-commentary",
+	"name": "Text Commentary",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Create collapsible commentary blocks with independent footnotes for annotating text",
+	"author": "Your Name",
+	"authorUrl": "https://github.com/yourusername",
+	"fundingUrl": "https://buymeacoffee.com/yourusername",
+	"isDesktopOnly": false
+}
