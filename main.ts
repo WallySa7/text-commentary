@@ -42,6 +42,19 @@ const FOOTNOTE_TYPES = {
 	question: { icon: "❓", color: "var(--text-error)" },
 };
 
+interface CommentaryBlockBounds {
+	startLine: number;
+	endLine: number;
+	textStart?: number;
+	textEnd?: number;
+	commentaryStart?: number;
+	commentaryEnd?: number;
+	footnoteStart?: number;
+	footnoteEnd?: number;
+	metadataStart?: number;
+	metadataEnd?: number;
+}
+
 export default class CommentaryPlugin extends Plugin {
 	settings: CommentaryPluginSettings;
 	blockCounter: number = 0;
@@ -92,6 +105,101 @@ export default class CommentaryPlugin extends Plugin {
 
 		// Add styles
 		this.addStyles();
+	}
+
+	// NEW: Helper method to find current commentary block boundaries
+	getCurrentCommentaryBlockBounds(
+		editor: Editor,
+		cursorLine: number
+	): CommentaryBlockBounds | null {
+		const lines = editor.getValue().split("\n");
+		let blockStart = -1;
+		let blockEnd = -1;
+
+		// Find the start of the current commentary block
+		for (let i = cursorLine; i >= 0; i--) {
+			if (lines[i].startsWith("```commentary")) {
+				blockStart = i;
+				break;
+			}
+			if (lines[i].startsWith("```") && i < cursorLine) {
+				// Found a different code block, cursor is not in commentary block
+				return null;
+			}
+		}
+
+		if (blockStart === -1) {
+			return null; // Not in a commentary block
+		}
+
+		// Find the end of the current commentary block
+		for (let i = blockStart + 1; i < lines.length; i++) {
+			if (lines[i].startsWith("```")) {
+				blockEnd = i;
+				break;
+			}
+		}
+
+		if (blockEnd === -1) {
+			blockEnd = lines.length; // Block extends to end of file
+		}
+
+		// Find section boundaries within the block
+		const bounds: CommentaryBlockBounds = {
+			startLine: blockStart,
+			endLine: blockEnd,
+		};
+
+		let currentSection = "";
+		for (let i = blockStart + 1; i < blockEnd; i++) {
+			const line = lines[i];
+
+			if (line.startsWith("---metadata---")) {
+				if (currentSection === "metadata") bounds.metadataEnd = i;
+				bounds.metadataStart = i;
+				currentSection = "metadata";
+			} else if (line.startsWith("---text---")) {
+				if (currentSection === "metadata") bounds.metadataEnd = i;
+				if (currentSection === "text") bounds.textEnd = i;
+				bounds.textStart = i;
+				currentSection = "text";
+			} else if (line.startsWith("---commentary---")) {
+				if (currentSection === "text") bounds.textEnd = i;
+				if (currentSection === "commentary") bounds.commentaryEnd = i;
+				bounds.commentaryStart = i;
+				currentSection = "commentary";
+			} else if (line.startsWith("---footnote---")) {
+				if (currentSection === "commentary") bounds.commentaryEnd = i;
+				if (currentSection === "footnote") bounds.footnoteEnd = i;
+				bounds.footnoteStart = i;
+				currentSection = "footnote";
+			}
+		}
+
+		// Set end boundaries for the last section
+		if (
+			currentSection === "metadata" &&
+			bounds.metadataStart !== undefined
+		) {
+			bounds.metadataEnd = blockEnd;
+		} else if (
+			currentSection === "text" &&
+			bounds.textStart !== undefined
+		) {
+			bounds.textEnd = blockEnd;
+		} else if (
+			currentSection === "commentary" &&
+			bounds.commentaryStart !== undefined
+		) {
+			bounds.commentaryEnd = blockEnd;
+		} else if (
+			currentSection === "footnote" &&
+			bounds.footnoteStart !== undefined
+		) {
+			bounds.footnoteEnd = blockEnd;
+		}
+
+		return bounds;
 	}
 
 	processCommentaryBlock(
@@ -706,7 +814,11 @@ $[1]: This is a footnote definition. You can use different types like note:, war
 		const cursor = editor.getCursor();
 
 		// Check if we're inside a commentary block
-		if (!this.isInCommentaryBlock(editor, cursor.line)) {
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
 			new Notice(
 				"Place cursor inside a commentary block to insert a footnote"
 			);
@@ -732,8 +844,11 @@ $[1]: This is a footnote definition. You can use different types like note:, war
 			return;
 		}
 
-		// Find the next available footnote number
-		const nextNumber = this.getNextFootnoteNumber(editor);
+		// Find the next available footnote number within this block
+		const nextNumber = this.getNextFootnoteNumberInBlock(
+			editor,
+			blockBounds
+		);
 
 		// Insert the reference at cursor position
 		const reference = `$[${nextNumber}]`;
@@ -741,9 +856,10 @@ $[1]: This is a footnote definition. You can use different types like note:, war
 
 		// Find the end of the commentary section to add the definition
 		const definitionTemplate = `$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`;
-		const cursorPosition = this.addFootnoteDefinition(
+		const cursorPosition = this.addFootnoteDefinitionToBlock(
 			editor,
-			definitionTemplate
+			definitionTemplate,
+			blockBounds
 		);
 
 		// Move cursor to the footnote definition area
@@ -767,7 +883,11 @@ $[1]: This is a footnote definition. You can use different types like note:, war
 	insertMultilineFootnote(editor: Editor) {
 		const cursor = editor.getCursor();
 
-		if (!this.isInCommentaryBlock(editor, cursor.line)) {
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
 			new Notice(
 				"Place cursor inside a commentary block to insert a footnote"
 			);
@@ -793,8 +913,11 @@ $[1]: This is a footnote definition. You can use different types like note:, war
 			return;
 		}
 
-		// Find the next available footnote number
-		const nextNumber = this.getNextFootnoteNumber(editor);
+		// Find the next available footnote number within this block
+		const nextNumber = this.getNextFootnoteNumberInBlock(
+			editor,
+			blockBounds
+		);
 
 		// Insert the reference at cursor position
 		const reference = `$[${nextNumber}]`;
@@ -803,9 +926,10 @@ $[1]: This is a footnote definition. You can use different types like note:, war
 		// Add multi-line definition template
 		const definitionTemplate = `$[${nextNumber}]: ${this.settings.defaultFootnoteType}:Multi-line footnote content here.
 Continue writing on multiple lines as needed.`;
-		const cursorPosition = this.addFootnoteDefinition(
+		const cursorPosition = this.addFootnoteDefinitionToBlock(
 			editor,
-			definitionTemplate
+			definitionTemplate,
+			blockBounds
 		);
 
 		// Move cursor to the footnote definition area, specifically to select the placeholder text
@@ -840,7 +964,11 @@ Continue writing on multiple lines as needed.`;
 		const cursor = editor.getCursor();
 
 		// Check if we're inside a commentary block
-		if (!this.isInCommentaryBlock(editor, cursor.line)) {
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
 			new Notice(
 				"Place cursor inside a commentary block to use footnotes"
 			);
@@ -871,8 +999,22 @@ Continue writing on multiple lines as needed.`;
 	}
 
 	createNewFootnote(editor: Editor, cursor: { line: number; ch: number }) {
-		// Find the next available footnote number
-		const nextNumber = this.getNextFootnoteNumber(editor);
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
+			new Notice(
+				"Place cursor inside a commentary block to create footnotes"
+			);
+			return;
+		}
+
+		// Find the next available footnote number within this block
+		const nextNumber = this.getNextFootnoteNumberInBlock(
+			editor,
+			blockBounds
+		);
 
 		// Insert the reference at cursor position
 		const reference = `$[${nextNumber}]`;
@@ -880,9 +1022,10 @@ Continue writing on multiple lines as needed.`;
 
 		// Create the definition template
 		const definitionTemplate = `$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`;
-		const cursorPosition = this.addFootnoteDefinition(
+		const cursorPosition = this.addFootnoteDefinitionToBlock(
 			editor,
-			definitionTemplate
+			definitionTemplate,
+			blockBounds
 		);
 
 		// Move cursor to the footnote definition area
@@ -900,6 +1043,35 @@ Continue writing on multiple lines as needed.`;
 		new Notice(
 			`Footnote ${nextNumber} created. Start typing the definition.`
 		);
+	}
+
+	// UPDATED: Only look for footnotes within the current commentary block
+	getNextFootnoteNumberInBlock(
+		editor: Editor,
+		blockBounds: CommentaryBlockBounds
+	): number {
+		const lines = editor.getValue().split("\n");
+		const footnoteRefs: number[] = [];
+
+		// Only scan within the current block boundaries
+		for (
+			let i = blockBounds.startLine;
+			i < Math.min(blockBounds.endLine, lines.length);
+			i++
+		) {
+			const line = lines[i];
+			const matches = line.match(/\$\[(\d+)\]/g);
+			if (matches) {
+				matches.forEach((match) => {
+					const numMatch = match.match(/\$\[(\d+)\]/);
+					if (numMatch) {
+						footnoteRefs.push(parseInt(numMatch[1]));
+					}
+				});
+			}
+		}
+
+		return footnoteRefs.length > 0 ? Math.max(...footnoteRefs) + 1 : 1;
 	}
 
 	checkFootnoteNavigation(
@@ -977,7 +1149,11 @@ Continue writing on multiple lines as needed.`;
 	navigateFootnote(editor: Editor) {
 		const cursor = editor.getCursor();
 
-		if (!this.isInCommentaryBlock(editor, cursor.line)) {
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
 			new Notice(
 				"Place cursor inside a commentary block to navigate footnotes"
 			);
@@ -1025,45 +1201,31 @@ Continue writing on multiple lines as needed.`;
 		);
 	}
 
+	// UPDATED: Only search within the current commentary block
 	navigateToFootnoteDefinition(editor: Editor, footnoteNumber: number) {
-		const content = editor.getValue();
-		const lines = content.split("\n");
+		const cursor = editor.getCursor();
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
+			new Notice("Not in a commentary block");
+			return;
+		}
 
-		// Find the footnote definition in the footnote section
-		let inFootnoteSection = false;
-		let inCommentaryBlock = false;
+		const lines = editor.getValue().split("\n");
 
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-
-			// Track if we're in a commentary block
-			if (line.startsWith("```commentary")) {
-				inCommentaryBlock = true;
-				continue;
-			}
-
-			if (inCommentaryBlock && line.startsWith("```")) {
-				break; // End of commentary block
-			}
-
-			// Track if we're in the footnote section
-			if (inCommentaryBlock && line.startsWith("---footnote---")) {
-				inFootnoteSection = true;
-				continue;
-			}
-
-			if (
-				inCommentaryBlock &&
-				(line.startsWith("---commentary---") ||
-					line.startsWith("---text---") ||
-					line.startsWith("---metadata---"))
+		// Only search within the current block's footnote section
+		if (
+			blockBounds.footnoteStart !== undefined &&
+			blockBounds.footnoteEnd !== undefined
+		) {
+			for (
+				let i = blockBounds.footnoteStart + 1;
+				i < blockBounds.footnoteEnd;
+				i++
 			) {
-				inFootnoteSection = false;
-				continue;
-			}
-
-			// Look for the footnote definition
-			if (inFootnoteSection) {
+				const line = lines[i];
 				const definitionPattern = new RegExp(
 					`^\\$\\[${footnoteNumber}\\]:`
 				);
@@ -1077,8 +1239,6 @@ Continue writing on multiple lines as needed.`;
 					};
 
 					editor.setCursor(position);
-
-					// Scroll to the position
 					editor.scrollIntoView({
 						from: position,
 						to: position,
@@ -1092,44 +1252,36 @@ Continue writing on multiple lines as needed.`;
 			}
 		}
 
-		new Notice(`Footnote ${footnoteNumber} definition not found.`);
+		new Notice(
+			`Footnote ${footnoteNumber} definition not found in this block.`
+		);
 	}
 
+	// UPDATED: Only search within the current commentary block
 	navigateToFootnoteReference(editor: Editor, footnoteNumber: number) {
-		const content = editor.getValue();
-		const lines = content.split("\n");
+		const cursor = editor.getCursor();
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (!blockBounds) {
+			new Notice("Not in a commentary block");
+			return;
+		}
 
-		let inCommentarySection = false;
-		let inCommentaryBlock = false;
+		const lines = editor.getValue().split("\n");
 
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-
-			if (line.startsWith("```commentary")) {
-				inCommentaryBlock = true;
-				continue;
-			}
-
-			if (inCommentaryBlock && line.startsWith("```")) {
-				break; // End of commentary block
-			}
-
-			if (inCommentaryBlock && line.startsWith("---commentary---")) {
-				inCommentarySection = true;
-				continue;
-			}
-
-			if (
-				inCommentaryBlock &&
-				(line.startsWith("---footnote---") ||
-					line.startsWith("---text---") ||
-					line.startsWith("---metadata---"))
+		// Only search within the current block's commentary section
+		if (
+			blockBounds.commentaryStart !== undefined &&
+			blockBounds.commentaryEnd !== undefined
+		) {
+			for (
+				let i = blockBounds.commentaryStart + 1;
+				i < blockBounds.commentaryEnd;
+				i++
 			) {
-				inCommentarySection = false;
-				continue;
-			}
-
-			if (inCommentarySection) {
+				const line = lines[i];
 				const referencePattern = new RegExp(
 					`\\$\\[${footnoteNumber}\\]`
 				);
@@ -1154,11 +1306,22 @@ Continue writing on multiple lines as needed.`;
 		}
 
 		new Notice(
-			`Footnote ${footnoteNumber} reference not found in commentary section.`
+			`Footnote ${footnoteNumber} reference not found in this block's commentary section.`
 		);
 	}
 
+	// DEPRECATED: Use getNextFootnoteNumberInBlock instead
 	getNextFootnoteNumber(editor: Editor): number {
+		const cursor = editor.getCursor();
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (blockBounds) {
+			return this.getNextFootnoteNumberInBlock(editor, blockBounds);
+		}
+
+		// Fallback to old behavior if not in a block
 		const content = editor.getValue();
 		const footnoteRefs = content.match(/\$\[(\d+)\]/g) || [];
 		const footnoteNums = footnoteRefs.map((ref) => {
@@ -1169,10 +1332,69 @@ Continue writing on multiple lines as needed.`;
 		return footnoteNums.length > 0 ? Math.max(...footnoteNums) + 1 : 1;
 	}
 
+	// UPDATED: Add footnote definition to the specific block only
+	addFootnoteDefinitionToBlock(
+		editor: Editor,
+		definition: string,
+		blockBounds: CommentaryBlockBounds
+	): { line: number; ch: number } | null {
+		const lines = editor.getValue().split("\n");
+		let insertLine = -1;
+
+		if (blockBounds.footnoteStart !== undefined) {
+			// Add to existing footnote section
+			insertLine = blockBounds.footnoteEnd || blockBounds.endLine;
+		} else {
+			// Create footnote section before the end of the block
+			insertLine = blockBounds.endLine;
+
+			// Insert the footnote section header and definition
+			const newLines = [
+				...lines.slice(0, insertLine),
+				"",
+				"---footnote---",
+				definition,
+				...lines.slice(insertLine),
+			];
+
+			editor.setValue(newLines.join("\n"));
+
+			// Return position for the inserted definition
+			return { line: insertLine + 2, ch: 0 }; // +2 for empty line and section header
+		}
+
+		// Insert just the definition in existing footnote section
+		const newLines = [
+			...lines.slice(0, insertLine),
+			definition,
+			...lines.slice(insertLine),
+		];
+
+		editor.setValue(newLines.join("\n"));
+
+		// Return position for the inserted definition
+		return { line: insertLine, ch: 0 };
+	}
+
+	// DEPRECATED: Use addFootnoteDefinitionToBlock instead
 	addFootnoteDefinition(
 		editor: Editor,
 		definition: string
 	): { line: number; ch: number } | null {
+		const cursor = editor.getCursor();
+		const blockBounds = this.getCurrentCommentaryBlockBounds(
+			editor,
+			cursor.line
+		);
+		if (blockBounds) {
+			return this.addFootnoteDefinitionToBlock(
+				editor,
+				definition,
+				blockBounds
+			);
+		}
+
+		// Fallback to old behavior
 		const content = editor.getValue();
 		const lines = content.split("\n");
 
@@ -1237,16 +1459,7 @@ Continue writing on multiple lines as needed.`;
 	}
 
 	isInCommentaryBlock(editor: Editor, line: number): boolean {
-		for (let i = line; i >= 0; i--) {
-			const checkLine = editor.getLine(i);
-			if (checkLine.startsWith("```commentary")) {
-				return true;
-			}
-			if (checkLine.startsWith("```") && i < line) {
-				return false;
-			}
-		}
-		return false;
+		return this.getCurrentCommentaryBlockBounds(editor, line) !== null;
 	}
 
 	addStyles() {
@@ -1413,38 +1626,26 @@ Continue writing on multiple lines as needed.`;
             
             
             .footnote-ref {
-                margin: 0 2px;
+                margin: 0;
                 display: inline;
                 vertical-align: super;
-                background: var(--interactive-accent);
-                border-radius: 3px;
-                padding: 1px 3px;
-                line-height: 1;
-                font-size: 0.8em;
-                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
-                transition: all 0.2s ease;
             }
             
-            .footnote-ref:hover {
-                background: var(--interactive-accent-hover);
-                transform: translateY(-1px);
-                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
-            }
             
             .footnote-ref a {
-                color: var(--text-on-accent) !important;
+                color: var(--link-color);
                 text-decoration: none;
                 font-weight: 600;
                 padding: 0;
                 display: inline;
-                transition: none;
+                transition: all 0.2s;
             }
             
             .footnote-ref a:hover {
-                color: var(--text-on-accent) !important;
-                text-decoration: none;
-                background: transparent !important;
-                border-radius: 0;
+                color: var(--link-color-hover);
+                text-decoration: underline;
+                background: var(--background-modifier-hover);
+                border-radius: 3px;
             }
             
             .commentary-footnotes {
