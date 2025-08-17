@@ -88,6 +88,16 @@ export default class CommentaryPlugin extends Plugin {
 			hotkeys: [{ modifiers: ["Ctrl", "Alt"], key: "f" }],
 		});
 
+		// Add command to navigate between footnote reference and definition
+		this.addCommand({
+			id: "navigate-footnote",
+			name: "Navigate Between Footnote Reference and Definition",
+			editorCallback: (editor: Editor, view: MarkdownView) => {
+				this.navigateFootnote(editor);
+			},
+			hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "g" }],
+		});
+
 		// Add command to toggle all blocks
 		this.addCommand({
 			id: "toggle-all-blocks",
@@ -112,11 +122,16 @@ export default class CommentaryPlugin extends Plugin {
 		const blockId = `commentary-block-${this.blockCounter++}`;
 
 		// Parse the source content
-		const { originalText, commentary, metadata } =
+		const { originalText, commentary, footnotes, metadata } =
 			this.parseBlockContent(source);
 
 		// Store block data for later reference
-		this.blockRegistry.set(blockId, { originalText, commentary, metadata });
+		this.blockRegistry.set(blockId, {
+			originalText,
+			commentary,
+			footnotes,
+			metadata,
+		});
 
 		// Create the block container
 		const container = el.createDiv({ cls: "commentary-block-container" });
@@ -191,7 +206,7 @@ export default class CommentaryPlugin extends Plugin {
 
 		// Add statistics if enabled
 		if (this.settings.enableStatistics) {
-			const stats = this.calculateStatistics(commentary);
+			const stats = this.calculateStatistics(commentary, footnotes);
 			const statsEl = commentaryHeader.createEl("span", {
 				cls: "commentary-stats",
 				text: ` (${stats.words} words, ${stats.footnotes} footnotes)`,
@@ -202,9 +217,10 @@ export default class CommentaryPlugin extends Plugin {
 			cls: "commentary-content",
 		});
 
-		// Process footnotes in commentary
-		const { processedText, footnotes } = this.processFootnotes(
+		// Process footnotes in commentary using the footnotes section
+		const { processedText, footnotesList } = this.processFootnotes(
 			commentary,
+			footnotes,
 			blockId
 		);
 
@@ -219,19 +235,19 @@ export default class CommentaryPlugin extends Plugin {
 		);
 
 		// Add footnotes section if there are any
-		if (footnotes.length > 0) {
+		if (footnotesList.length > 0) {
 			const footnotesSection = commentaryContent.createDiv({
 				cls: "commentary-footnotes",
 			});
 			const footnotesHeader = footnotesSection.createEl("h5", {
 				text: "Footnotes",
 			});
-			const footnotesList = footnotesSection.createEl("ol", {
+			const footnotesList_el = footnotesSection.createEl("ol", {
 				cls: "footnotes-list",
 			});
 
-			footnotes.forEach((footnote, index) => {
-				const li = footnotesList.createEl("li");
+			footnotesList.forEach((footnote, index) => {
+				const li = footnotesList_el.createEl("li");
 				li.setAttribute("id", `${blockId}-footnote-${index + 1}`);
 				li.setAttribute("data-footnote-num", String(index + 1));
 
@@ -289,6 +305,7 @@ export default class CommentaryPlugin extends Plugin {
 		const lines = source.split("\n");
 		let originalText = "";
 		let commentary = "";
+		let footnotes = "";
 		let metadata: any = {};
 		let currentSection = "";
 
@@ -299,6 +316,10 @@ export default class CommentaryPlugin extends Plugin {
 			}
 			if (line.startsWith("---commentary---")) {
 				currentSection = "commentary";
+				continue;
+			}
+			if (line.startsWith("---footnote---")) {
+				currentSection = "footnote";
 				continue;
 			}
 			if (line.startsWith("---metadata---")) {
@@ -312,6 +333,9 @@ export default class CommentaryPlugin extends Plugin {
 					break;
 				case "commentary":
 					commentary += line + "\n";
+					break;
+				case "footnote":
+					footnotes += line + "\n";
 					break;
 				case "metadata":
 					// Parse metadata lines (e.g., title: My Title, tags: tag1, tag2)
@@ -330,47 +354,92 @@ export default class CommentaryPlugin extends Plugin {
 			}
 		}
 
-		return { originalText, commentary, metadata };
+		return { originalText, commentary, footnotes, metadata };
 	}
 
 	processFootnotes(
-		text: string,
+		commentaryText: string,
+		footnotesText: string,
 		blockId: string
-	): { processedText: string; footnotes: string[] } {
-		const footnotes: string[] = [];
-		let footnoteCounter = 0;
+	): { processedText: string; footnotesList: string[] } {
+		const footnotesList: string[] = [];
+		const footnoteDefinitions: Map<number, string> = new Map();
 
-		// Enhanced patterns for single and multi-line footnotes
-		const singleLinePattern = /\{\{fn(?::(\w+))?:(.*?)\}\}/g;
-		const multiLinePattern = /\{\{fn(?::(\w+))?\[\[([\s\S]*?)\]\]\}\}/g;
+		// First, find all footnote definitions in the footnotes section: $[1]: content here
+		const definitionPattern =
+			/\$\[(\d+)\]:\s*(.+(?:\n(?!\$\[\d+\]:|\n\s*$).*)*)/gm;
 
-		// First process multi-line footnotes
-		let processedText = text.replace(
-			multiLinePattern,
-			(match, type, footnoteText) => {
-				footnoteCounter++;
-				const fullNote = type
-					? `${type}:${footnoteText.trim()}`
-					: footnoteText.trim();
-				footnotes.push(fullNote);
-				return `{{fnref:${footnoteCounter}}}`;
+		// Extract footnote definitions from the footnotes section
+		let defMatch;
+		definitionPattern.lastIndex = 0;
+		while ((defMatch = definitionPattern.exec(footnotesText)) !== null) {
+			const num = parseInt(defMatch[1]);
+			const content = defMatch[2].trim();
+			footnoteDefinitions.set(num, content);
+		}
+
+		// Find all footnote references in the commentary: $[1], $[2], etc.
+		const referencePattern = /\$\[(\d+)\]/g;
+		const references: Array<{ match: string; num: number; index: number }> =
+			[];
+		let refMatch;
+
+		referencePattern.lastIndex = 0;
+		while ((refMatch = referencePattern.exec(commentaryText)) !== null) {
+			const num = parseInt(refMatch[1]);
+			references.push({
+				match: refMatch[0],
+				num: num,
+				index: refMatch.index,
+			});
+		}
+
+		// Sort references by their position in the text
+		references.sort((a, b) => a.index - b.index);
+
+		// Create footnotes array in order of appearance and replace references
+		let processedText = commentaryText;
+		let offset = 0;
+		const usedFootnotes: Set<number> = new Set();
+
+		references.forEach((ref) => {
+			if (!usedFootnotes.has(ref.num)) {
+				// Add to footnotes array if we haven't seen this number before
+				const content =
+					footnoteDefinitions.get(ref.num) ||
+					`Missing footnote definition for ${ref.num}`;
+				footnotesList.push(content);
+				usedFootnotes.add(ref.num);
 			}
-		);
 
-		// Then process single-line footnotes
-		processedText = processedText.replace(
-			singleLinePattern,
-			(match, type, footnoteText) => {
-				footnoteCounter++;
-				const fullNote = type
-					? `${type}:${footnoteText.trim()}`
-					: footnoteText.trim();
-				footnotes.push(fullNote);
-				return `{{fnref:${footnoteCounter}}}`;
-			}
-		);
+			// Get the position of this footnote in the final footnotes array
+			const footnoteIndex =
+				Array.from(usedFootnotes)
+					.sort((a, b) => {
+						// Find first occurrence of each footnote number
+						const aIndex =
+							references.find((r) => r.num === a)?.index ?? 0;
+						const bIndex =
+							references.find((r) => r.num === b)?.index ?? 0;
+						return aIndex - bIndex;
+					})
+					.indexOf(ref.num) + 1;
 
-		return { processedText, footnotes };
+			// Calculate the actual position accounting for previous replacements
+			const actualIndex = ref.index + offset;
+			const replacement = `{{fnref:${footnoteIndex}}}`;
+
+			// Replace the reference with the internal marker
+			processedText =
+				processedText.substring(0, actualIndex) +
+				replacement +
+				processedText.substring(actualIndex + ref.match.length);
+
+			// Update offset
+			offset += replacement.length - ref.match.length;
+		});
+
+		return { processedText, footnotesList };
 	}
 
 	parseFootnoteContent(footnote: string): { type: string; content: string } {
@@ -546,17 +615,17 @@ export default class CommentaryPlugin extends Plugin {
 		}
 	}
 
-	calculateStatistics(text: string): { words: number; footnotes: number } {
-		const words = text
+	calculateStatistics(
+		commentaryText: string,
+		footnotesText: string = ""
+	): { words: number; footnotes: number } {
+		const words = commentaryText
 			.split(/\s+/)
 			.filter((word) => word.length > 0).length;
-		const footnoteMatches = text.match(/\{\{fn.*?\}\}/g);
-		const multiFootnoteMatches = text.match(
-			/\{\{fn.*?\[\[[\s\S]*?\]\]\}\}/g
-		);
-		const footnotes =
-			(footnoteMatches?.length || 0) +
-			(multiFootnoteMatches?.length || 0);
+
+		// Count footnote references in commentary using the new syntax: $[1], $[2], etc.
+		const footnoteMatches = commentaryText.match(/\$\[(\d+)\]/g);
+		const footnotes = footnoteMatches?.length || 0;
 
 		return { words, footnotes };
 	}
@@ -565,7 +634,11 @@ export default class CommentaryPlugin extends Plugin {
 		const blockData = this.blockRegistry.get(blockId);
 		if (!blockData) return;
 
-		const exportContent = `# Commentary Block Export\n\n## Original Text\n${blockData.originalText}\n\n## Commentary\n${blockData.commentary}`;
+		const exportContent = `# Commentary Block Export\n\n## Original Text\n${
+			blockData.originalText
+		}\n\n## Commentary\n${blockData.commentary}\n\n## Footnotes\n${
+			blockData.footnotes || ""
+		}`;
 
 		const blob = new Blob([exportContent], { type: "text/markdown" });
 		const url = URL.createObjectURL(blob);
@@ -582,7 +655,10 @@ export default class CommentaryPlugin extends Plugin {
 		const blockData = this.blockRegistry.get(blockId);
 		if (!blockData) return;
 
-		const stats = this.calculateStatistics(blockData.commentary);
+		const stats = this.calculateStatistics(
+			blockData.commentary,
+			blockData.footnotes
+		);
 		const originalStats = this.calculateStatistics(blockData.originalText);
 
 		new Notice(`📊 Block Statistics:
@@ -639,22 +715,14 @@ tags: analysis, notes
 ---commentary---
 Your commentary goes here. 
 
-Single-line footnote: {{fn:Your footnote text here}}
-Multi-line footnote: {{fn[[
-This is a multi-line footnote.
-You can write multiple paragraphs here.
+This text has footnotes $[1] and more references $[2] that explain various points.
 
-- Even lists
-- Work perfectly
-]]}}
+You can also use typed footnotes $[3] for different purposes.
 
-Typed footnotes:
-- Note: {{fn:note:This is a regular note}}
-- Warning: {{fn:warning:Important warning here}}
-- Info: {{fn:info:Additional information}}
-- Reference: {{fn:reference:Source citation}}
-- Idea: {{fn:idea:A brilliant idea}}
-- Question: {{fn:question:Something to investigate}}
+---footnote---
+$[1]: This is a simple footnote with basic information.
+$[2]: warning:This is a warning footnote with important information.
+$[3]: idea:This footnote contains a brilliant idea or insight.
 \`\`\``;
 
 		editor.replaceSelection(template);
@@ -671,16 +739,55 @@ Typed footnotes:
 			return;
 		}
 
-		const footnoteTemplate = `{{fn:${this.settings.defaultFootnoteType}:}}`;
-		editor.replaceSelection(footnoteTemplate);
+		// Check if cursor is in a footnote definition
+		const footnoteNavigation = this.checkFootnoteNavigation(editor, cursor);
+		if (footnoteNavigation) {
+			if (footnoteNavigation.inFootnoteSection) {
+				// We're in footnote section, navigate to reference
+				this.navigateToFootnoteReference(
+					editor,
+					footnoteNavigation.number
+				);
+			} else {
+				// We're in commentary section on a reference, navigate to definition
+				this.navigateToFootnoteDefinition(
+					editor,
+					footnoteNavigation.number
+				);
+			}
+			return;
+		}
 
-		// Position cursor inside the footnote
-		const typeLength = this.settings.defaultFootnoteType.length;
-		const newCursor = {
-			line: cursor.line,
-			ch: cursor.ch + 5 + typeLength + 1,
-		};
-		editor.setCursor(newCursor);
+		// Find the next available footnote number
+		const nextNumber = this.getNextFootnoteNumber(editor);
+
+		// Insert the reference at cursor position
+		const reference = `$[${nextNumber}]`;
+		editor.replaceSelection(reference);
+
+		// Find the end of the commentary section to add the definition
+		const definitionTemplate = `$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`;
+		const cursorPosition = this.addFootnoteDefinition(
+			editor,
+			definitionTemplate
+		);
+
+		// Move cursor to the footnote definition area
+		if (cursorPosition) {
+			// Position cursor after the type and colon, ready for content
+			const typeLength = this.settings.defaultFootnoteType.length;
+			editor.setCursor({
+				line: cursorPosition.line,
+				ch:
+					cursorPosition.ch +
+					`$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`
+						.length,
+			});
+		}
+
+		new Notice(
+			`Footnote ${nextNumber} inserted. Start typing the definition.`
+		);
 	}
 
 	insertMultilineFootnote(editor: Editor) {
@@ -693,18 +800,413 @@ Typed footnotes:
 			return;
 		}
 
-		const footnoteTemplate = `{{fn:${this.settings.defaultFootnoteType}:[[]]}}`;
+		// Check if cursor is in a footnote definition
+		const footnoteNavigation = this.checkFootnoteNavigation(editor, cursor);
+		if (footnoteNavigation) {
+			if (footnoteNavigation.inFootnoteSection) {
+				// We're in footnote section, navigate to reference
+				this.navigateToFootnoteReference(
+					editor,
+					footnoteNavigation.number
+				);
+			} else {
+				// We're in commentary section on a reference, navigate to definition
+				this.navigateToFootnoteDefinition(
+					editor,
+					footnoteNavigation.number
+				);
+			}
+			return;
+		}
 
-		editor.replaceSelection(footnoteTemplate);
+		// Find the next available footnote number
+		const nextNumber = this.getNextFootnoteNumber(editor);
 
-		const typeLength = this.settings.defaultFootnoteType.length;
+		// Insert the reference at cursor position
+		const reference = `$[${nextNumber}]`;
+		editor.replaceSelection(reference);
 
-		// Position cursor inside the multi-line footnote
-		const newLine = cursor.line + 1;
-		editor.setCursor({
-			line: cursor.line,
-			ch: cursor.ch + 5 + typeLength + 3,
+		// Add multi-line definition template
+		const definitionTemplate = `$[${nextNumber}]: ${this.settings.defaultFootnoteType}:Multi-line footnote content here.
+Continue writing on multiple lines as needed.`;
+		const cursorPosition = this.addFootnoteDefinition(
+			editor,
+			definitionTemplate
+		);
+
+		// Move cursor to the footnote definition area, specifically to select the placeholder text
+		if (cursorPosition) {
+			const typeLength = this.settings.defaultFootnoteType.length;
+			const prefixLength =
+				`$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`
+					.length;
+
+			// Select the placeholder text "Multi-line footnote content here."
+			editor.setSelection(
+				{
+					line: cursorPosition.line,
+					ch: cursorPosition.ch + prefixLength,
+				},
+				{
+					line: cursorPosition.line,
+					ch:
+						cursorPosition.ch +
+						prefixLength +
+						"Multi-line footnote content here.".length,
+				}
+			);
+		}
+
+		new Notice(
+			`Multi-line footnote ${nextNumber} inserted. Replace the placeholder text.`
+		);
+	}
+
+	checkFootnoteNavigation(
+		editor: Editor,
+		cursor: { line: number; ch: number }
+	): { number: number; inFootnoteSection: boolean } | null {
+		const currentLine = editor.getLine(cursor.line);
+
+		// Check if current line is a footnote definition: $[1]: content
+		const footnoteDefMatch = currentLine.match(/^\$\[(\d+)\]:/);
+		if (footnoteDefMatch) {
+			const footnoteNumber = parseInt(footnoteDefMatch[1]);
+			const inFootnoteSection = this.isInFootnoteSection(
+				editor,
+				cursor.line
+			);
+
+			return {
+				number: footnoteNumber,
+				inFootnoteSection: inFootnoteSection,
+			};
+		}
+
+		// Check if cursor is on a footnote reference: $[1]
+		const footnoteRefPattern = /\$\[(\d+)\]/g;
+		let match;
+
+		while ((match = footnoteRefPattern.exec(currentLine)) !== null) {
+			const startPos = match.index;
+			const endPos = match.index + match[0].length;
+
+			// Check if cursor is within this footnote reference
+			if (cursor.ch >= startPos && cursor.ch <= endPos) {
+				const footnoteNumber = parseInt(match[1]);
+				const inFootnoteSection = this.isInFootnoteSection(
+					editor,
+					cursor.line
+				);
+
+				return {
+					number: footnoteNumber,
+					inFootnoteSection: inFootnoteSection,
+				};
+			}
+		}
+
+		return null;
+	}
+
+	isInFootnoteSection(editor: Editor, line: number): boolean {
+		// Look backwards from current line to find section markers
+		for (let i = line; i >= 0; i--) {
+			const checkLine = editor.getLine(i);
+
+			if (checkLine.startsWith("---footnote---")) {
+				return true;
+			}
+
+			if (
+				checkLine.startsWith("---commentary---") ||
+				checkLine.startsWith("---text---") ||
+				checkLine.startsWith("---metadata---")
+			) {
+				return false;
+			}
+
+			if (checkLine.startsWith("```")) {
+				return false;
+			}
+		}
+
+		return false;
+	}
+
+	navigateFootnote(editor: Editor) {
+		const cursor = editor.getCursor();
+
+		if (!this.isInCommentaryBlock(editor, cursor.line)) {
+			new Notice(
+				"Place cursor inside a commentary block to navigate footnotes"
+			);
+			return;
+		}
+
+		// Check if we're in a footnote definition
+		const footnoteNavigation = this.checkFootnoteNavigation(editor, cursor);
+		if (footnoteNavigation) {
+			if (footnoteNavigation.inFootnoteSection) {
+				// We're in footnote section, navigate to reference
+				this.navigateToFootnoteReference(
+					editor,
+					footnoteNavigation.number
+				);
+			} else {
+				// We're in commentary section, navigate to definition
+				this.navigateToFootnoteDefinition(
+					editor,
+					footnoteNavigation.number
+				);
+			}
+			return;
+		}
+
+		// Check if cursor is on a footnote reference in commentary
+		const currentLine = editor.getLine(cursor.line);
+		const footnoteRefPattern = /\$\[(\d+)\]/g;
+		let match;
+
+		while ((match = footnoteRefPattern.exec(currentLine)) !== null) {
+			const startPos = match.index;
+			const endPos = match.index + match[0].length;
+
+			// Check if cursor is within this footnote reference
+			if (cursor.ch >= startPos && cursor.ch <= endPos) {
+				const footnoteNumber = parseInt(match[1]);
+				this.navigateToFootnoteDefinition(editor, footnoteNumber);
+				return;
+			}
+		}
+
+		new Notice(
+			"Place cursor on a footnote reference or definition to navigate"
+		);
+	}
+
+	navigateToFootnoteDefinition(editor: Editor, footnoteNumber: number) {
+		const content = editor.getValue();
+		const lines = content.split("\n");
+
+		// Find the footnote definition in the footnote section
+		let inFootnoteSection = false;
+		let inCommentaryBlock = false;
+
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+
+			// Track if we're in a commentary block
+			if (line.startsWith("```commentary")) {
+				inCommentaryBlock = true;
+				continue;
+			}
+
+			if (inCommentaryBlock && line.startsWith("```")) {
+				break; // End of commentary block
+			}
+
+			// Track if we're in the footnote section
+			if (inCommentaryBlock && line.startsWith("---footnote---")) {
+				inFootnoteSection = true;
+				continue;
+			}
+
+			if (
+				inCommentaryBlock &&
+				(line.startsWith("---commentary---") ||
+					line.startsWith("---text---") ||
+					line.startsWith("---metadata---"))
+			) {
+				inFootnoteSection = false;
+				continue;
+			}
+
+			// Look for the footnote definition
+			if (inFootnoteSection) {
+				const definitionPattern = new RegExp(
+					`^\\$\\[${footnoteNumber}\\]:`
+				);
+				const match = definitionPattern.exec(line);
+
+				if (match) {
+					// Found the definition, move cursor to it
+					const position = {
+						line: i,
+						ch: match[0].length, // Position after the colon
+					};
+
+					editor.setCursor(position);
+
+					// Scroll to the position
+					editor.scrollIntoView({
+						from: position,
+						to: position,
+					});
+
+					new Notice(
+						`Jumped to footnote ${footnoteNumber} definition.`
+					);
+					return;
+				}
+			}
+		}
+
+		new Notice(`Footnote ${footnoteNumber} definition not found.`);
+	}
+
+	navigateToFootnoteReference(editor: Editor, footnoteNumber: number) {
+		const content = editor.getValue();
+		const lines = content.split("\n");
+
+		// Track state
+		let inCommentarySection = false;
+		let inCommentaryBlock = false;
+
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+
+			// Track if we're in a commentary block
+			if (line.startsWith("```commentary")) {
+				inCommentaryBlock = true;
+				continue;
+			}
+
+			if (inCommentaryBlock && line.startsWith("```")) {
+				break; // End of commentary block
+			}
+
+			// Track if we're in the commentary section
+			if (inCommentaryBlock && line.startsWith("---commentary---")) {
+				inCommentarySection = true;
+				continue;
+			}
+
+			if (
+				inCommentaryBlock &&
+				(line.startsWith("---footnote---") ||
+					line.startsWith("---text---") ||
+					line.startsWith("---metadata---"))
+			) {
+				inCommentarySection = false;
+				continue;
+			}
+
+			// Look for the footnote reference in the commentary section
+			if (inCommentarySection) {
+				const referencePattern = new RegExp(
+					`\\$\\[${footnoteNumber}\\]`
+				);
+				const match = referencePattern.exec(line);
+
+				if (match) {
+					// Found the reference, move cursor to it
+					const position = {
+						line: i,
+						ch: match.index,
+					};
+
+					editor.setCursor(position);
+
+					// Scroll to the position and highlight it briefly
+					editor.scrollIntoView({
+						from: position,
+						to: {
+							line: position.line,
+							ch: position.ch + match[0].length,
+						},
+					});
+
+					new Notice(
+						`Jumped to footnote ${footnoteNumber} reference in commentary.`
+					);
+					return;
+				}
+			}
+		}
+
+		// If nothing found
+		new Notice(
+			`Footnote ${footnoteNumber} reference not found in commentary section.`
+		);
+	}
+
+	getNextFootnoteNumber(editor: Editor): number {
+		const content = editor.getValue();
+		const footnoteRefs = content.match(/\$\[(\d+)\]/g) || [];
+		const footnoteNums = footnoteRefs.map((ref) => {
+			const match = ref.match(/\$\[(\d+)\]/);
+			return match ? parseInt(match[1]) : 0;
 		});
+
+		return footnoteNums.length > 0 ? Math.max(...footnoteNums) + 1 : 1;
+	}
+
+	addFootnoteDefinition(
+		editor: Editor,
+		definition: string
+	): { line: number; ch: number } | null {
+		const content = editor.getValue();
+		const lines = content.split("\n");
+
+		// Find the footnote section or the end of the commentary block
+		let footnoteStart = -1;
+		let blockEnd = -1;
+		let inCommentaryBlock = false;
+		let insertLine = -1;
+
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+
+			if (line.startsWith("```commentary")) {
+				inCommentaryBlock = true;
+				continue;
+			}
+
+			if (inCommentaryBlock && line.startsWith("```")) {
+				blockEnd = i;
+				break;
+			}
+
+			if (inCommentaryBlock && line.startsWith("---footnote---")) {
+				footnoteStart = i;
+				continue;
+			}
+		}
+
+		let newContent;
+
+		if (footnoteStart > 0) {
+			// Add to existing footnote section
+			insertLine = blockEnd > 0 ? blockEnd : lines.length;
+			newContent = [
+				...lines.slice(0, insertLine),
+				definition,
+				...lines.slice(insertLine),
+			].join("\n");
+		} else if (blockEnd > 0) {
+			// Create footnote section
+			insertLine = blockEnd;
+			newContent = [
+				...lines.slice(0, blockEnd),
+				"",
+				"---footnote---",
+				definition,
+				...lines.slice(blockEnd),
+			].join("\n");
+			// Adjust insert line for the new section header
+			insertLine += 2; // Account for empty line and ---footnote--- line
+		} else {
+			// Fallback: add at the end
+			insertLine = lines.length;
+			newContent = content + "\n\n---footnote---\n" + definition;
+			insertLine += 2; // Account for empty line and ---footnote--- line
+		}
+
+		editor.setValue(newContent);
+
+		// Return the cursor position for the inserted definition
+		return { line: insertLine, ch: 0 };
 	}
 
 	isInCommentaryBlock(editor: Editor, line: number): boolean {
@@ -1193,32 +1695,40 @@ class CommentarySettingTab extends PluginSettingTab {
 		shortcutsEl.innerHTML = `
             <ul>
                 <li><code>Ctrl+Shift+C</code> - Insert new commentary block</li>
-                <li><code>Ctrl+Shift+F</code> - Insert single-line footnote</li>
-                <li><code>Ctrl+Alt+F</code> - Insert multi-line footnote</li>
+                <li><code>Ctrl+Shift+F</code> - Insert footnote reference and definition (or navigate to reference if in definition)</li>
+                <li><code>Ctrl+Alt+F</code> - Insert multi-line footnote reference and definition (or navigate to reference if in definition)</li>
+                <li><code>Ctrl+Shift+G</code> - Navigate between footnote reference and definition</li>
                 <li>Use command palette for: Toggle all blocks</li>
             </ul>
         `;
 
-		containerEl.createEl("h3", { text: "Footnote Types & Syntax" });
-		const typesEl = containerEl.createEl("div", {
+		containerEl.createEl("h3", { text: "Footnote Syntax" });
+		const syntaxEl = containerEl.createEl("div", {
 			cls: "setting-item-description",
 		});
-		typesEl.innerHTML = `
-            <p><strong>Single-line footnote:</strong> <code>{{fn:Your text}}</code></p>
-            <p><strong>Multi-line footnote:</strong></p>
-            <pre>{{fn[[
-Your multi-line
-footnote text here
-]]}}</pre>
+		syntaxEl.innerHTML = `
+            <p><strong>Block Structure:</strong></p>
+            <pre>---commentary---
+This is text with a footnote $[1] and another $[2].
+
+---footnote---
+$[1]: This is the first footnote.
+$[2]: This is the second footnote.</pre>
+            <p><strong>Footnote Reference:</strong> <code>$[1]</code>, <code>$[2]</code>, etc.</p>
+            <p><strong>Footnote Definition:</strong> <code>$[1]: Your footnote content here</code></p>
             <p><strong>Typed footnotes:</strong></p>
             <ul>
-                <li>📝 Note: <code>{{fn:note:Text}}</code></li>
-                <li>⚠️ Warning: <code>{{fn:warning:Text}}</code></li>
-                <li>ℹ️ Info: <code>{{fn:info:Text}}</code></li>
-                <li>📚 Reference: <code>{{fn:reference:Text}}</code></li>
-                <li>💡 Idea: <code>{{fn:idea:Text}}</code></li>
-                <li>❓ Question: <code>{{fn:question:Text}}</code></li>
+                <li>📝 Note: <code>$[1]: note:Text</code></li>
+                <li>⚠️ Warning: <code>$[2]: warning:Text</code></li>
+                <li>ℹ️ Info: <code>$[3]: info:Text</code></li>
+                <li>📚 Reference: <code>$[4]: reference:Text</code></li>
+                <li>💡 Idea: <code>$[5]: idea:Text</code></li>
+                <li>❓ Question: <code>$[6]: question:Text</code></li>
             </ul>
+            <p><strong>Multi-line footnotes:</strong></p>
+            <pre>$[1]: This is a multi-line footnote
+that can span multiple lines naturally.
+Just continue writing on the next lines.</pre>
         `;
 	}
 }
