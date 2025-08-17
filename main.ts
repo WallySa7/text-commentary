@@ -68,34 +68,14 @@ export default class CommentaryPlugin extends Plugin {
 			hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "c" }],
 		});
 
-		// Add command to insert footnote
+		// Add command to insert footnote (unified command)
 		this.addCommand({
 			id: "insert-footnote",
-			name: "Insert Footnote in Commentary Block",
+			name: "Insert/Navigate Footnote",
 			editorCallback: (editor: Editor, view: MarkdownView) => {
-				this.insertFootnote(editor);
+				this.handleFootnote(editor);
 			},
 			hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "f" }],
-		});
-
-		// Add command for multi-line footnote
-		this.addCommand({
-			id: "insert-multiline-footnote",
-			name: "Insert Multi-line Footnote",
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				this.insertMultilineFootnote(editor);
-			},
-			hotkeys: [{ modifiers: ["Ctrl", "Alt"], key: "f" }],
-		});
-
-		// Add command to navigate between footnote reference and definition
-		this.addCommand({
-			id: "navigate-footnote",
-			name: "Navigate Between Footnote Reference and Definition",
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				this.navigateFootnote(editor);
-			},
-			hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "g" }],
 		});
 
 		// Add command to toggle all blocks
@@ -713,16 +693,10 @@ tags: analysis, notes
 [Insert the original text to comment on here / متن اصلی را اینجا وارد کنید]
 
 ---commentary---
-Your commentary goes here. 
-
-This text has footnotes $[1] and more references $[2] that explain various points.
-
-You can also use typed footnotes $[3] for different purposes.
+Your commentary goes here. Use Ctrl+Shift+F to add footnotes $[1] anywhere in your text.
 
 ---footnote---
-$[1]: This is a simple footnote with basic information.
-$[2]: warning:This is a warning footnote with important information.
-$[3]: idea:This footnote contains a brilliant idea or insight.
+$[1]: This is a footnote definition. You can use different types like note:, warning:, info:, reference:, idea:, or question: before your content.
 \`\`\``;
 
 		editor.replaceSelection(template);
@@ -859,6 +833,72 @@ Continue writing on multiple lines as needed.`;
 
 		new Notice(
 			`Multi-line footnote ${nextNumber} inserted. Replace the placeholder text.`
+		);
+	}
+
+	handleFootnote(editor: Editor) {
+		const cursor = editor.getCursor();
+
+		// Check if we're inside a commentary block
+		if (!this.isInCommentaryBlock(editor, cursor.line)) {
+			new Notice(
+				"Place cursor inside a commentary block to use footnotes"
+			);
+			return;
+		}
+
+		// Check if cursor is on an existing footnote (reference or definition)
+		const footnoteNavigation = this.checkFootnoteNavigation(editor, cursor);
+		if (footnoteNavigation) {
+			if (footnoteNavigation.inFootnoteSection) {
+				// We're in footnote section, navigate to reference
+				this.navigateToFootnoteReference(
+					editor,
+					footnoteNavigation.number
+				);
+			} else {
+				// We're in commentary section on a reference, navigate to definition
+				this.navigateToFootnoteDefinition(
+					editor,
+					footnoteNavigation.number
+				);
+			}
+			return;
+		}
+
+		// No existing footnote found, create a new one
+		this.createNewFootnote(editor, cursor);
+	}
+
+	createNewFootnote(editor: Editor, cursor: { line: number; ch: number }) {
+		// Find the next available footnote number
+		const nextNumber = this.getNextFootnoteNumber(editor);
+
+		// Insert the reference at cursor position
+		const reference = `$[${nextNumber}]`;
+		editor.replaceSelection(reference);
+
+		// Create the definition template
+		const definitionTemplate = `$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`;
+		const cursorPosition = this.addFootnoteDefinition(
+			editor,
+			definitionTemplate
+		);
+
+		// Move cursor to the footnote definition area
+		if (cursorPosition) {
+			// Position cursor after the type and colon, ready for content
+			editor.setCursor({
+				line: cursorPosition.line,
+				ch:
+					cursorPosition.ch +
+					`$[${nextNumber}]: ${this.settings.defaultFootnoteType}:`
+						.length,
+			});
+		}
+
+		new Notice(
+			`Footnote ${nextNumber} created. Start typing the definition.`
 		);
 	}
 
@@ -1059,14 +1099,12 @@ Continue writing on multiple lines as needed.`;
 		const content = editor.getValue();
 		const lines = content.split("\n");
 
-		// Track state
 		let inCommentarySection = false;
 		let inCommentaryBlock = false;
 
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
 
-			// Track if we're in a commentary block
 			if (line.startsWith("```commentary")) {
 				inCommentaryBlock = true;
 				continue;
@@ -1076,7 +1114,6 @@ Continue writing on multiple lines as needed.`;
 				break; // End of commentary block
 			}
 
-			// Track if we're in the commentary section
 			if (inCommentaryBlock && line.startsWith("---commentary---")) {
 				inCommentarySection = true;
 				continue;
@@ -1092,7 +1129,6 @@ Continue writing on multiple lines as needed.`;
 				continue;
 			}
 
-			// Look for the footnote reference in the commentary section
 			if (inCommentarySection) {
 				const referencePattern = new RegExp(
 					`\\$\\[${footnoteNumber}\\]`
@@ -1100,15 +1136,8 @@ Continue writing on multiple lines as needed.`;
 				const match = referencePattern.exec(line);
 
 				if (match) {
-					// Found the reference, move cursor to it
-					const position = {
-						line: i,
-						ch: match.index,
-					};
-
+					const position = { line: i, ch: match.index };
 					editor.setCursor(position);
-
-					// Scroll to the position and highlight it briefly
 					editor.scrollIntoView({
 						from: position,
 						to: {
@@ -1116,7 +1145,6 @@ Continue writing on multiple lines as needed.`;
 							ch: position.ch + match[0].length,
 						},
 					});
-
 					new Notice(
 						`Jumped to footnote ${footnoteNumber} reference in commentary.`
 					);
@@ -1125,7 +1153,6 @@ Continue writing on multiple lines as needed.`;
 			}
 		}
 
-		// If nothing found
 		new Notice(
 			`Footnote ${footnoteNumber} reference not found in commentary section.`
 		);
@@ -1384,26 +1411,40 @@ Continue writing on multiple lines as needed.`;
                 margin-bottom: 0;
             }
             
+            
             .footnote-ref {
                 margin: 0 2px;
                 display: inline;
                 vertical-align: super;
+                background: var(--interactive-accent);
+                border-radius: 3px;
+                padding: 1px 3px;
+                line-height: 1;
+                font-size: 0.8em;
+                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+                transition: all 0.2s ease;
+            }
+            
+            .footnote-ref:hover {
+                background: var(--interactive-accent-hover);
+                transform: translateY(-1px);
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
             }
             
             .footnote-ref a {
-                color: var(--link-color);
+                color: var(--text-on-accent) !important;
                 text-decoration: none;
                 font-weight: 600;
-                padding: 0 2px;
+                padding: 0;
                 display: inline;
-                transition: all 0.2s;
+                transition: none;
             }
             
             .footnote-ref a:hover {
-                color: var(--link-color-hover);
-                text-decoration: underline;
-                background: var(--background-modifier-hover);
-                border-radius: 3px;
+                color: var(--text-on-accent) !important;
+                text-decoration: none;
+                background: transparent !important;
+                border-radius: 0;
             }
             
             .commentary-footnotes {
@@ -1692,14 +1733,38 @@ class CommentarySettingTab extends PluginSettingTab {
 		const shortcutsEl = containerEl.createEl("div", {
 			cls: "setting-item-description",
 		});
+
 		shortcutsEl.innerHTML = `
             <ul>
                 <li><code>Ctrl+Shift+C</code> - Insert new commentary block</li>
-                <li><code>Ctrl+Shift+F</code> - Insert footnote reference and definition (or navigate to reference if in definition)</li>
-                <li><code>Ctrl+Alt+F</code> - Insert multi-line footnote reference and definition (or navigate to reference if in definition)</li>
-                <li><code>Ctrl+Shift+G</code> - Navigate between footnote reference and definition</li>
+                <li><code>Ctrl+Shift+F</code> - Smart footnote command:
+                    <ul>
+                        <li>In empty space → Create new footnote + jump to definition</li>
+                        <li>On footnote reference → Jump to definition</li>
+                        <li>On footnote definition → Jump to reference</li>
+                    </ul>
+                </li>
                 <li>Use command palette for: Toggle all blocks</li>
             </ul>
+        `;
+
+		containerEl.createEl("h3", { text: "How to Use Footnotes" });
+		const usageEl = containerEl.createEl("div", {
+			cls: "setting-item-description",
+		});
+		usageEl.innerHTML = `
+            <p><strong>One Command Does Everything:</strong> <code>Ctrl+Shift+F</code></p>
+            <ul>
+                <li><strong>Create footnote:</strong> Place cursor anywhere in commentary text and press the shortcut</li>
+                <li><strong>Jump to definition:</strong> Place cursor on any footnote reference like <code>$[1]</code> and press the shortcut</li>
+                <li><strong>Jump to reference:</strong> Place cursor on any footnote definition and press the shortcut</li>
+            </ul>
+            <p><strong>Footnote Structure:</strong></p>
+            <pre>---commentary---
+This text has a footnote $[1] here.
+
+---footnote---
+$[1]: The footnote definition goes here.</pre>
         `;
 
 		containerEl.createEl("h3", { text: "Footnote Syntax" });
